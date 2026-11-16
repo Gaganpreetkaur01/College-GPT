@@ -4,5 +4,3 @@ __pycache__/
 *.pyc
 .env
 .streamlit/secrets.toml
-college_database/
-PDFs/
