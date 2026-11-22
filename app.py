@@ -23,24 +23,34 @@ st.set_page_config(
 )
 
 BASE_DIR = Path(__file__).resolve().parent
+
 PDF_DIR = BASE_DIR / "PDFs"
-DB_DIR = BASE_DIR / "college_database"
-
 PDF_DIR.mkdir(exist_ok=True)
-DB_DIR.mkdir(exist_ok=True)
 
-CHAT_MODEL = "gemini-3.8-flash"
+# On Render, set CHROMA_DB_PATH=/var/data/college_database
+# Locally, the existing database folder is reused.
+DB_DIR = Path(
+    os.getenv(
+        "CHROMA_DB_PATH",
+        str(BASE_DIR / "college_database")
+    )
+)
+
+DB_DIR.mkdir(parents=True, exist_ok=True)
+
+CHAT_MODEL = "gemini-3.5-flash-lite"
 EMBED_MODEL = "gemini-embedding-001"
 
 COLLECTION_NAME = "college_documents"
 
-# Faster indexing settings
 CHUNK_SIZE = 200
 CHUNK_OVERLAP = 30
+
 BATCH_SIZE = 5
-BATCH_DELAY = 20
+BATCH_DELAY = 2
 
 TOP_K = 5
+
 
 # ==========================================
 # 2. GEMINI API
@@ -51,25 +61,39 @@ API_KEY = os.getenv("GEMINI_API_KEY")
 if not API_KEY:
     st.error(
         "Gemini API key missing. "
-        "Set GEMINI_API_KEY in PowerShell and restart."
+        "Please set GEMINI_API_KEY in your environment."
     )
     st.stop()
 
-client = genai.Client(api_key=API_KEY)
+
+@st.cache_resource
+def get_gemini_client(api_key):
+    return genai.Client(api_key=api_key)
+
+
+client = get_gemini_client(API_KEY)
 
 
 # ==========================================
-# 3. DATABASE
+# 3. PERSISTENT CHROMADB
 # ==========================================
 
-db = chromadb.PersistentClient(
-    path=str(DB_DIR)
-)
+@st.cache_resource
+def get_database(database_path):
 
-collection = db.get_or_create_collection(
-    name=COLLECTION_NAME,
-    metadata={"hnsw:space": "cosine"}
-)
+    db_client = chromadb.PersistentClient(
+        path=database_path
+    )
+
+    db_collection = db_client.get_or_create_collection(
+        name=COLLECTION_NAME,
+        metadata={"hnsw:space": "cosine"}
+    )
+
+    return db_client, db_collection
+
+
+db, collection = get_database(str(DB_DIR))
 
 
 # ==========================================
@@ -85,12 +109,14 @@ except Exception:
 def split_text(text):
 
     if tokenizer:
+
         tokens = tokenizer.encode(text)
         chunks = []
 
         step = CHUNK_SIZE - CHUNK_OVERLAP
 
         for start in range(0, len(tokens), step):
+
             part = tokens[start:start + CHUNK_SIZE]
 
             if part:
@@ -104,7 +130,10 @@ def split_text(text):
     step = CHUNK_SIZE - CHUNK_OVERLAP
 
     for start in range(0, len(words), step):
-        chunks.append(" ".join(words[start:start + CHUNK_SIZE]))
+
+        chunks.append(
+            " ".join(words[start:start + CHUNK_SIZE])
+        )
 
     return chunks
 
@@ -122,6 +151,7 @@ def read_all_pdfs():
     for pdf_file in pdf_files:
 
         try:
+
             reader = PdfReader(str(pdf_file))
 
             for page_number, page in enumerate(
@@ -155,6 +185,7 @@ def read_all_pdfs():
                     })
 
         except Exception as error:
+
             st.warning(
                 f"Could not read {pdf_file.name}: {error}"
             )
@@ -163,14 +194,31 @@ def read_all_pdfs():
 
 
 # ==========================================
-# 6. GEMINI EMBEDDINGS
+# 6. GEMINI RETRY SYSTEM
 # ==========================================
+
+def is_temporary_error(error):
+
+    error_text = str(error).upper()
+
+    return any(code in error_text for code in [
+        "429",
+        "500",
+        "502",
+        "503",
+        "504",
+        "RESOURCE_EXHAUSTED",
+        "UNAVAILABLE",
+        "INTERNAL"
+    ])
+
 
 def generate_embeddings(texts, task_type):
 
-    for attempt in range(3):
+    for attempt in range(4):
 
         try:
+
             response = client.models.embed_content(
                 model=EMBED_MODEL,
                 contents=texts,
@@ -186,22 +234,29 @@ def generate_embeddings(texts, task_type):
 
         except Exception as error:
 
-            error_text = str(error).upper()
-
-            if (
-                "429" in error_text
-                or "RESOURCE_EXHAUSTED" in error_text
-            ):
-
-                if attempt == 2:
-                    raise
-
-                wait_time = 25 * (attempt + 1)
-
-                time.sleep(wait_time)
-
-            else:
+            if attempt == 3 or not is_temporary_error(error):
                 raise
+
+            time.sleep(3 * (2 ** attempt))
+
+
+def generate_ai_response(prompt):
+
+    for attempt in range(4):
+
+        try:
+
+            return client.models.generate_content(
+                model=CHAT_MODEL,
+                contents=prompt
+            )
+
+        except Exception as error:
+
+            if attempt == 3 or not is_temporary_error(error):
+                raise
+
+            time.sleep(3 * (2 ** attempt))
 
 
 # ==========================================
@@ -210,12 +265,17 @@ def generate_embeddings(texts, task_type):
 
 def index_pdfs():
 
+    # This function runs only during first indexing
+    # or when the user manually requests an update.
+
     documents, pdf_files = read_all_pdfs()
 
     if not pdf_files:
+
         return 0, 0, "No PDF files found in PDFs folder."
 
     if not documents:
+
         return (
             len(pdf_files),
             0,
@@ -229,7 +289,16 @@ def index_pdfs():
         if item["id"] not in existing_ids
     ]
 
+    if not new_documents:
+
+        return (
+            len(pdf_files),
+            0,
+            "All PDF chunks are already stored. Nothing to download."
+        )
+
     added = 0
+
     total_batches = (
         len(new_documents) + BATCH_SIZE - 1
     ) // BATCH_SIZE
@@ -245,16 +314,21 @@ def index_pdfs():
             start:start + BATCH_SIZE
         ]
 
-        texts = [item["text"] for item in batch]
+        texts = [
+            item["text"] for item in batch
+        ]
 
         try:
+
             embeddings = generate_embeddings(
                 texts,
                 "RETRIEVAL_DOCUMENT"
             )
 
             collection.add(
-                ids=[item["id"] for item in batch],
+                ids=[
+                    item["id"] for item in batch
+                ],
                 documents=texts,
                 embeddings=embeddings,
                 metadatas=[
@@ -287,7 +361,7 @@ def index_pdfs():
             return (
                 len(pdf_files),
                 added,
-                f"Indexing stopped. {added} chunks added. Error: {error}"
+                f"Indexing stopped after {added} chunks. Error: {error}"
             )
 
         if start + BATCH_SIZE < len(new_documents):
@@ -296,17 +370,59 @@ def index_pdfs():
     progress.empty()
     status.empty()
 
-    return len(pdf_files), added, None
+    return (
+        len(pdf_files),
+        added,
+        None
+    )
 
 
 # ==========================================
-# 8. RETRIEVE COLLEGE DOCUMENTS
+# 8. LOAD EXISTING DATABASE
+# ==========================================
+
+def initialize_knowledge_base():
+
+    # IMPORTANT:
+    # If chunks already exist, DO NOT READ PDFs.
+    # Reuse the existing ChromaDB database.
+
+    stored_chunks = collection.count()
+
+    if stored_chunks > 0:
+
+        return (
+            len(list(PDF_DIR.glob("*.pdf"))),
+            f"Existing knowledge loaded: {stored_chunks} chunks."
+        )
+
+    # Only first-time indexing reaches this section.
+
+    total, added, error = index_pdfs()
+
+    if error:
+
+        return total, error
+
+    return (
+        total,
+        f"First indexing complete. Added {added} chunks."
+    )
+
+
+# ==========================================
+# 9. RETRIEVE COLLEGE DOCUMENTS
 # ==========================================
 
 def retrieve_documents(question):
 
-    if collection.count() == 0:
+    total_chunks = collection.count()
+
+    if total_chunks == 0:
         return [], []
+
+    # Only the QUESTION is embedded here.
+    # Existing document embeddings are reused.
 
     query_embedding = generate_embeddings(
         [question],
@@ -315,7 +431,7 @@ def retrieve_documents(question):
 
     results = collection.query(
         query_embeddings=[query_embedding],
-        n_results=min(TOP_K, collection.count())
+        n_results=min(TOP_K, total_chunks)
     )
 
     documents = results["documents"][0] or []
@@ -325,7 +441,7 @@ def retrieve_documents(question):
 
 
 # ==========================================
-# 9. GEMINI AI CHAT
+# 10. COLLEGE GPT AI CHAT
 # ==========================================
 
 def ask_college_gpt(question, history):
@@ -334,14 +450,16 @@ def ask_college_gpt(question, history):
     metadatas = []
 
     try:
-        if collection.count() > 0:
-            documents, metadatas = retrieve_documents(
-                question
-            )
 
-    except Exception:
-        # General AI can still answer if PDF search fails
-        pass
+        documents, metadatas = retrieve_documents(
+            question
+        )
+
+    except Exception as error:
+
+        st.warning(
+            f"Document search temporarily unavailable: {error}"
+        )
 
     context = ""
     references = []
@@ -351,14 +469,14 @@ def ask_college_gpt(question, history):
     ):
 
         context += (
-            f"\nPDF: {metadata['source']}\n"
-            f"Page: {metadata['page']}\n"
+            f"\nPDF: {metadata.get('source', 'Unknown')}\n"
+            f"Page: {metadata.get('page', 'Unknown')}\n"
             f"Content: {document}\n"
         )
 
         references.append({
-            "source": metadata["source"],
-            "page": metadata["page"]
+            "source": metadata.get("source", "Unknown"),
+            "page": metadata.get("page", "Unknown")
         })
 
     previous_chat = ""
@@ -380,7 +498,7 @@ GENERAL QUESTIONS:
 - Do not require PDFs for general questions.
 
 COLLEGE QUESTIONS:
-- Use provided college PDF context for college facts.
+- Use the provided college PDF context for college facts.
 - Never invent fees, dates, rules or syllabus details.
 - If college information is missing, say it was not found.
 - Never invent PDF names or page numbers.
@@ -406,10 +524,7 @@ STUDENT QUESTION:
 Give the best possible answer.
 """
 
-    response = client.models.generate_content(
-        model=CHAT_MODEL,
-        contents=prompt
-    )
+    response = generate_ai_response(prompt)
 
     answer = response.text or "No response generated."
 
@@ -417,7 +532,7 @@ Give the best possible answer.
 
 
 # ==========================================
-# 10. CHATGPT STYLE DESIGN
+# 11. CHATGPT STYLE DESIGN
 # ==========================================
 
 st.markdown("""
@@ -453,14 +568,14 @@ h1, h2, h3, p {
 
 
 # ==========================================
-# 11. SESSION STATE
+# 12. SESSION STATE
 # ==========================================
 
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
 
-if "pdf_loaded" not in st.session_state:
-    st.session_state.pdf_loaded = False
+if "knowledge_initialized" not in st.session_state:
+    st.session_state.knowledge_initialized = False
 
 if "pdf_count" not in st.session_state:
     st.session_state.pdf_count = 0
@@ -470,28 +585,44 @@ if "index_status" not in st.session_state:
 
 
 # ==========================================
-# 12. AUTOMATIC PDF LOADING
+# 13. SMART FIRST-TIME INITIALIZATION
 # ==========================================
 
-if not st.session_state.pdf_loaded:
+if not st.session_state.knowledge_initialized:
 
-    with st.spinner("Loading your college PDFs..."):
+    if collection.count() > 0:
 
-        total, added, error = index_pdfs()
+        # FAST OPEN:
+        # Existing database is reused.
+        # No PDF reading, chunking or embedding.
 
-        st.session_state.pdf_count = total
-        st.session_state.pdf_loaded = True
+        st.session_state.pdf_count = len(
+            list(PDF_DIR.glob("*.pdf"))
+        )
 
-        if error:
-            st.session_state.index_status = error
-        else:
-            st.session_state.index_status = (
-                f"Successfully added {added} new chunks."
-            )
+        st.session_state.index_status = (
+            f"Knowledge Base ready: {collection.count()} stored chunks."
+        )
+
+    else:
+
+        # Only when the database is empty,
+        # perform the first-time PDF indexing.
+
+        with st.spinner(
+            "First-time setup: preparing college documents..."
+        ):
+
+            total, status = initialize_knowledge_base()
+
+            st.session_state.pdf_count = total
+            st.session_state.index_status = status
+
+    st.session_state.knowledge_initialized = True
 
 
 # ==========================================
-# 13. SIDEBAR
+# 14. SIDEBAR
 # ==========================================
 
 with st.sidebar:
@@ -524,27 +655,33 @@ with st.sidebar:
 
     st.caption("Powered by Gemini AI")
 
-    if st.session_state.index_status:
-        st.caption(st.session_state.index_status)
+    st.caption(
+        st.session_state.index_status
+    )
 
     st.divider()
 
     if st.button(
-        "🔄 Reload PDF Documents",
+        "🔄 Update PDF Documents",
         use_container_width=True
     ):
 
-        with st.spinner("Updating PDF knowledge..."):
+        with st.spinner(
+            "Checking for new PDF documents..."
+        ):
 
             total, added, error = index_pdfs()
 
             st.session_state.pdf_count = total
 
             if error:
+
                 st.error(error)
+
             else:
+
                 st.success(
-                    f"Added {added} new chunks."
+                    f"Update complete! Added {added} new chunks."
                 )
 
             st.session_state.index_status = (
@@ -553,37 +690,44 @@ with st.sidebar:
 
 
 # ==========================================
-# 14. MAIN CHAT SCREEN
+# 15. MAIN CHAT SCREEN
 # ==========================================
 
 if not st.session_state.chat_history:
 
     st.markdown(
-        "<h1 style='text-align:center; "
-        "margin-top:100px;'>🎓 College GPT</h1>",
+        """
+        <h1 style='text-align:center; margin-top:100px;'>
+            🎓 College GPT
+        </h1>
+        """,
         unsafe_allow_html=True
     )
 
     st.markdown(
-        "<p style='text-align:center; color:#aaaaaa;'>"
-        "Ask anything. Learn anything."
-        "</p>",
+        """
+        <p style='text-align:center; color:#aaaaaa;'>
+            Ask anything. Learn anything.
+        </p>
+        """,
         unsafe_allow_html=True
     )
 
     st.markdown(
-        "<p style='text-align:center;'>"
-        "📚 Syllabus &nbsp; | &nbsp; "
-        "💰 Fees &nbsp; | &nbsp; "
-        "📅 Calendar &nbsp; | &nbsp; "
-        "💡 General AI"
-        "</p>",
+        """
+        <p style='text-align:center;'>
+            📚 Syllabus &nbsp; | &nbsp;
+            💰 Fees &nbsp; | &nbsp;
+            📅 Calendar &nbsp; | &nbsp;
+            💡 General AI
+        </p>
+        """,
         unsafe_allow_html=True
     )
 
 
 # ==========================================
-# 15. DISPLAY CHAT HISTORY
+# 16. DISPLAY CHAT HISTORY
 # ==========================================
 
 for message in st.session_state.chat_history:
@@ -612,7 +756,7 @@ for message in st.session_state.chat_history:
 
 
 # ==========================================
-# 16. CHAT INPUT
+# 17. CHAT INPUT
 # ==========================================
 
 question = st.chat_input(
